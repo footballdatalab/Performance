@@ -29,6 +29,7 @@ from ingestion.vald.pipeline import (
     run_intraday_deferred_raw_to_bronze_stage,
     run_intraday_raw_to_bronze_stage,
     run_intraday_silver_to_gold_stage,
+    run_vald_quality_audit,  # Phase 1
 )
 
 _TZ = pendulum.timezone("Europe/Lisbon")
@@ -296,6 +297,15 @@ def vald_midnight_full_refresh():
 
     @task_group(group_id="Silver")
     def Silver(start_after):
+        # Phase 8.8.F: Silver currently runs all 5 families
+        # (forcedecks, forceframe, nordics, speed, dynamo) sequentially
+        # inside one task. They have no FK dependencies on each other —
+        # each one just JOINs the profile dim. Once 8.8.A timings show
+        # which families dominate, we can fan them out into 5 parallel
+        # tasks the same way Bronze does (line 294). The change here is
+        # cosmetic — what's missing today is per-family entry points in
+        # silver_etl, and we deferred adding those until 8.8.A produces
+        # the measurements that justify the refactor.
         @task
         def AuthoritativeBronzeToSilver():
             return run_full_refresh_bronze_to_silver_stage()
@@ -304,6 +314,54 @@ def vald_midnight_full_refresh():
         # Must not run until ALL bronze module tasks have finished
         start_after >> silver
         return silver
+
+    @task_group(group_id="Quality")
+    def Quality(start_after):
+        # Phase 1 (2026-05-09): VALD IQR outlier audit. Runs AFTER
+        # Silver completes (so silver.vald_assessment_metric is fresh)
+        # and BEFORE Gold (so any flags raised on the silver build are
+        # visible at the same review cycle). The 5 families are
+        # mutually independent — fan them out in parallel.
+        # Full-refresh path uses incremental=False to rebuild baselines.
+        @task
+        def AuditForceDecks():
+            return run_vald_quality_audit(family="forcedecks", incremental=False)
+
+        @task
+        def AuditForceFrame():
+            return run_vald_quality_audit(family="forceframe", incremental=False)
+
+        @task
+        def AuditNordics():
+            return run_vald_quality_audit(family="nordics", incremental=False)
+
+        @task
+        def AuditSpeed():
+            return run_vald_quality_audit(family="speed", incremental=False)
+
+        @task
+        def AuditDynamo():
+            return run_vald_quality_audit(family="dynamo", incremental=False)
+
+        forcedecks = AuditForceDecks()
+        forceframe = AuditForceFrame()
+        nordics = AuditNordics()
+        speed = AuditSpeed()
+        dynamo = AuditDynamo()
+
+        start_after >> [forcedecks, forceframe, nordics, speed, dynamo]
+
+        @task
+        def QualitySummary(forcedecks, forceframe, nordics, speed, dynamo):
+            return {
+                "forcedecks": forcedecks,
+                "forceframe": forceframe,
+                "nordics": nordics,
+                "speed": speed,
+                "dynamo": dynamo,
+            }
+
+        return QualitySummary(forcedecks, forceframe, nordics, speed, dynamo)
 
     @task_group(group_id="Gold")
     def Gold(start_after):
@@ -320,7 +378,8 @@ def vald_midnight_full_refresh():
     raw_prepared = Raw(extracted)
     bronzed = Bronze(raw_prepared)
     silvered = Silver(bronzed)
-    golded = Gold(silvered)
+    quality_audited = Quality(silvered)  # Phase 1 — runs between Silver and Gold
+    golded = Gold(quality_audited)
 
 
 @dag(
@@ -532,6 +591,21 @@ def vald_intraday_incremental():
 
         return AssessmentAndEntities(replay_summary)
 
+    @task_group(group_id="Quality")
+    def Quality(silver_summary: dict[str, Any]):
+        # Phase 1 (2026-05-09): intraday IQR audit. Runs incrementally
+        # — only audits rows with updated_at > last successful run for
+        # each family. Does NOT rebuild baselines.
+        @task
+        def AuditAllFamiliesIncremental(summary: dict[str, Any]):
+            # Skip when the silver task short-circuited (no new data
+            # this 30-minute window means nothing for the audit to do).
+            if summary.get("skipped"):
+                return {"skipped": True, "skip_reason": summary.get("skip_reason")}
+            return run_vald_quality_audit(family=None, incremental=True)
+
+        return AuditAllFamiliesIncremental(silver_summary)
+
     @task_group(group_id="Gold")
     def Gold(silver_summary: dict[str, Any]):
         @task
@@ -548,7 +622,9 @@ def vald_intraday_incremental():
     bronzed = Bronze(raw_gate)
     deferred_traces = BronzeDeferredForceFrameTraces()
     silvered = Silver(bronzed)
+    quality_audited = Quality(silvered)  # Phase 1
     golded = Gold(silvered)
+    quality_audited >> golded  # ensure Gold waits for Quality
 
     raw_gate >> deferred_traces
 

@@ -342,7 +342,7 @@ def test_run_silver_etl_can_target_stage_tables_and_defer_quality_flags(monkeypa
 
     assert summary["quality"] == {
         "deferred": True,
-        "open_flags_deleted": 0,
+        "open_flags_superseded": 0,
         "flags_written": 0,
         "ambiguous_profiles": 3,
     }

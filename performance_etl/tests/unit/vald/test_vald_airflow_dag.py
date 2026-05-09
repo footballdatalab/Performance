@@ -167,6 +167,12 @@ def test_airflow_dag_routes_intraday_and_midnight_work_to_named_stages(monkeypat
     fake_pipeline.run_historical_day_raw_to_bronze = lambda replay_date: {}
     fake_pipeline.run_historical_day_bronze_to_silver_stage = lambda incremental_scope=None: {}
     fake_pipeline.run_historical_day_silver_to_gold_stage = lambda incremental_scope=None: {}
+    # Phase 1 (2026-05-09): VALD IQR audit entry point.
+    fake_pipeline.run_vald_quality_audit = (
+        lambda family=None, incremental=True, limit=None: call_log.append(
+            ("run_vald_quality_audit", {"family": family, "incremental": incremental})
+        ) or {"families": {}, "total_flags": 0}
+    )
 
     fake_pendulum = types.ModuleType("pendulum")
     fake_pendulum.timezone = lambda name: name
@@ -374,6 +380,9 @@ def test_airflow_dag_allows_manual_intraday_runs_even_when_full_refresh_is_activ
         }
     )
     fake_pipeline.run_intraday_silver_to_gold_stage = lambda incremental_scope=None: {}
+    fake_pipeline.run_vald_quality_audit = (  # Phase 1
+        lambda family=None, incremental=True, limit=None: {"families": {}, "total_flags": 0}
+    )
     fake_pipeline.run_historical_day_raw_to_bronze = lambda replay_date: {}
     fake_pipeline.run_historical_day_bronze_to_silver_stage = lambda incremental_scope=None: {}
     fake_pipeline.run_historical_day_silver_to_gold_stage = lambda incremental_scope=None: {}

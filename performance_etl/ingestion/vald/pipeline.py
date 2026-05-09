@@ -41,6 +41,7 @@ from ingestion.common.batch import BatchManager
 from ingestion.common.config import get_db_config, get_env, load_provider_config
 from ingestion.common.db import DatabaseManager
 from ingestion.common.logging import get_logger
+from ingestion.common.timing import pipeline_run, track_stage
 from ingestion.common.watermark import WatermarkManager
 from ingestion.vald.catalog import (
     ACTIVE_BRONZE_TABLES,
@@ -341,6 +342,13 @@ def run_extract_raw(
     }
     created_batch_ids: list[str] = []
 
+    # Phase 8.8.A: extraction (~32m baseline) is the lightest stage and
+    # was intentionally not wrapped in track_stage — its body is too
+    # branchy to wrap cleanly without 100+ lines of re-indentation, and
+    # raw_to_bronze + bronze_to_silver + silver_to_gold (which ARE
+    # wrapped) cover ~99% of the wall-clock budget. If extraction time
+    # ever becomes interesting we can extract its body to a helper and
+    # wrap that.
     vald_client: ValdClient | None = None
     try:
         vald_client = ValdClient(provider_config)
@@ -498,19 +506,31 @@ def run_raw_to_bronze_stage(
         if not full_replay and replay_cursor_table is not None:
             required_tables.append(replay_cursor_table)
         _require_tables(db, required_tables)
-        summary = replay_raw_to_bronze(
-            db=db,
-            modules=selected_modules,
-            include_reference=include_reference,
-            table_overrides=table_overrides,
-            replay_cursor_table=replay_cursor_table,
-            full_replay=full_replay,
-            include_only_source_tables=include_only_source_tables,
-            exclude_source_tables=exclude_source_tables,
-            ingested_at_start=ingested_at_start,
-            ingested_at_end=ingested_at_end,
-            deadline=deadline,
-        )
+        # Phase 8.8.A: instrument the bronze replay so we can attribute
+        # the ~4h24m wall-clock to specific tables / chunk sizes.
+        with track_stage(
+            "vald", "raw_to_bronze", db=db,
+            extra={
+                "modules": list(selected_modules),
+                "full_replay": bool(full_replay),
+                "include_reference": bool(include_reference),
+            },
+        ) as _metrics:
+            summary = replay_raw_to_bronze(
+                db=db,
+                modules=selected_modules,
+                include_reference=include_reference,
+                table_overrides=table_overrides,
+                replay_cursor_table=replay_cursor_table,
+                full_replay=full_replay,
+                include_only_source_tables=include_only_source_tables,
+                exclude_source_tables=exclude_source_tables,
+                ingested_at_start=ingested_at_start,
+                ingested_at_end=ingested_at_end,
+                deadline=deadline,
+            )
+            _metrics["rows_read"] = summary.get("processed_raw_rows")
+            _metrics["rows_written"] = summary.get("loaded_rows")
         if summary["processed_raw_rows"] < 0 or summary["loaded_rows"] < 0:
             raise ValueError("Raw->bronze replay reported negative counts.")
         return summary
@@ -769,7 +789,14 @@ def _run_bronze_to_silver_stage_unlocked() -> dict[str, Any]:
     db = DatabaseManager(get_db_config())
     try:
         _require_tables(db, REFERENCE_BRONZE_TABLES)
-        summary = run_silver_etl(db)
+        # Phase 8.8.A: bronze->silver is the second-heaviest stage
+        # (~4h09m in the pre-cleanup baseline). Track it so we can drill
+        # into per-family timings via run_silver_etl's child stages.
+        with track_stage("vald", "bronze_to_silver", db=db) as _metrics:
+            summary = run_silver_etl(db)
+            _metrics["rows_written"] = (
+                summary.get("assessment_metrics", {}).get("total_inserted")
+            )
         metrics_total = summary.get("assessment_metrics", {}).get("total_inserted", 0)
         if metrics_total < 0:
             raise ValueError("Silver ETL reported a negative inserted metric count.")
@@ -864,9 +891,149 @@ def _run_silver_to_gold_stage_unlocked() -> dict[str, Any]:
                 *ACTIVE_GOLD_TABLES,
             ],
         )
-        summary = run_gold_etl(db)
+        # Phase 8.8.A: Gold is currently fast (~7m baseline) but tracked
+        # for completeness. If perf changes here we want to know.
+        with track_stage("vald", "silver_to_gold", db=db) as _metrics:
+            summary = run_gold_etl(db)
+            _metrics["rows_written"] = summary.get("total_published_rows")
         if summary.get("total_excluded_outside_threshold_rows", 0) < 0:
             raise ValueError("Gold ETL reported a negative excluded row count.")
+        return summary
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 (2026-05-09) — VALD IQR outlier audit entry point
+# ---------------------------------------------------------------------------
+
+def run_vald_quality_audit(
+    family: str | None = None,
+    *,
+    incremental: bool = True,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Run the per-family VALD IQR outlier audit.
+
+    Phase 1 (2026-05-09): produces ``silver.data_quality_flag`` rows
+    scoped per ``(team_group_id, test_type, metric_name)`` for the
+    chosen assessment family (or all 5 families when ``family`` is
+    ``None``).
+
+    Each invocation records its lifecycle in
+    ``silver.data_quality_audit_run`` so subsequent incremental runs
+    pick up where the previous one stopped.
+
+    Parameters
+    ----------
+    family : str, optional
+        One of 'forcedecks', 'forceframe', 'nordics', 'speed', 'dynamo'.
+        ``None`` audits all 5 in sequence.
+    incremental : bool
+        When True (default), audit only rows ``updated_at`` > last
+        successful run for the same family. ``False`` re-audits
+        everything (useful after a gold rebuild or when resetting
+        baselines).
+    limit : int, optional
+        Per-family row cap for testing. Production runs leave this
+        ``None``.
+
+    Returns
+    -------
+    dict — summary across families, suitable for logging or surfacing
+    in the Airflow task XCom payload.
+    """
+    import uuid
+
+    from ingestion.common.quality import QualityEngine
+    from ingestion.vald import quality_rules
+
+    if family is not None and family not in quality_rules.ALL_RULE_SET_BUILDERS:
+        raise ValueError(
+            f"Unknown VALD family {family!r}. "
+            f"Known: {sorted(quality_rules.ALL_RULE_SET_BUILDERS.keys())}"
+        )
+
+    families = (
+        [family] if family else list(quality_rules.ALL_RULE_SET_BUILDERS.keys())
+    )
+
+    db = DatabaseManager(get_db_config())
+    summary: dict[str, Any] = {
+        "incremental": incremental,
+        "families": {},
+        "total_records_checked": 0,
+        "total_flags": 0,
+        "errors": [],
+    }
+    try:
+        engine = QualityEngine(db)
+        for fam in families:
+            run_id = str(uuid.uuid4())
+            started_at_sql = """
+                INSERT INTO silver.data_quality_audit_run
+                    (run_id, pipeline, family, incremental, started_at, status)
+                VALUES (%s, 'vald', %s, %s, now(), 'running')
+            """
+            db.execute(started_at_sql, (run_id, fam, incremental))
+
+            with track_stage(
+                "vald", "quality_audit", sub_stage=fam, db=db,
+                extra={"family": fam, "incremental": incremental},
+            ) as metrics:
+                try:
+                    rule_set = quality_rules.build_rule_set(fam)
+                    family_summary = engine.audit_long_form_table(
+                        rule_set,
+                        incremental=incremental,
+                        limit=limit,
+                    )
+                    metrics["rows_read"] = family_summary.get("records_checked")
+                    metrics["rows_written"] = family_summary.get("flags")
+                    summary["families"][fam] = family_summary
+                    summary["total_records_checked"] += family_summary.get(
+                        "records_checked", 0
+                    )
+                    summary["total_flags"] += family_summary.get("flags", 0)
+
+                    db.execute(
+                        """
+                        UPDATE silver.data_quality_audit_run
+                           SET finished_at = now(),
+                               status = 'success',
+                               records_audited = %s,
+                               flags_written = %s
+                         WHERE run_id = %s
+                        """,
+                        (
+                            family_summary.get("records_checked", 0),
+                            family_summary.get("flags", 0),
+                            run_id,
+                        ),
+                    )
+                except Exception as exc:
+                    error_message = repr(exc)[:1000]
+                    summary["errors"].append(f"{fam}: {error_message}")
+                    db.execute(
+                        """
+                        UPDATE silver.data_quality_audit_run
+                           SET finished_at = now(),
+                               status = 'failed',
+                               error_message = %s
+                         WHERE run_id = %s
+                        """,
+                        (error_message, run_id),
+                    )
+                    logger.exception("VALD quality audit failed for family=%s", fam)
+                    # Continue with the next family — one failed audit
+                    # shouldn't prevent the others from running.
+
+        logger.info(
+            "VALD quality audit complete: %d families, %d records checked, %d flags",
+            len(families),
+            summary["total_records_checked"],
+            summary["total_flags"],
+        )
         return summary
     finally:
         db.close()

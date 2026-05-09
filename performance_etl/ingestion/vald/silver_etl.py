@@ -27,7 +27,9 @@ import psycopg2.extras
 from ingestion.common.config import load_provider_config
 from ingestion.common.db import DatabaseManager
 from ingestion.common.logging import get_logger
+from ingestion.common.perf import analyze_table
 from ingestion.common.quality import QualityEngine, QualityFlag
+from ingestion.common.timing import track_stage
 from ingestion.vald.cutoff import (
     VALD_CUTOFF_UTC,
     VALD_NEW_ENTRY_MIN_TESTS_UTC,
@@ -209,7 +211,7 @@ def run_silver_etl(
         else:
             quality_summary = {
                 "deferred": True,
-                "open_flags_deleted": 0,
+                "open_flags_superseded": 0,
                 "flags_written": 0,
                 "ambiguous_profiles": membership_summary.get("ambiguous_profiles", 0),
             }
@@ -240,7 +242,7 @@ def run_silver_etl(
         quality_summary = {
             "skipped": True,
             "skip_reason": "reference_entities_unchanged",
-            "open_flags_deleted": 0,
+            "open_flags_superseded": 0,
             "flags_written": 0,
             "ambiguous_profiles": 0,
         }
@@ -280,6 +282,18 @@ def run_silver_etl(
             day_end_utc=day_window[1] if day_window else None,
             scoped_test_ids_by_family=scoped_test_ids_by_family,
         )
+
+    # Phase 8.8.B: refresh planner stats so downstream gold reads pick
+    # good plans. Without this, the next silver_to_gold run uses stale
+    # statistics and chooses bad join orders / index strategies on
+    # silver.vald_assessment_metric. Cheap (seconds, not minutes) and
+    # safe inside the ETL pipeline (skip_locked=True swallows any
+    # transient lock failure).
+    with track_stage("vald", "silver.analyze", db=db):
+        analyze_table(db, tables["assessment"], skip_locked=True)
+        if refresh_reference_entities:
+            analyze_table(db, tables["profile"], skip_locked=True)
+            analyze_table(db, tables["membership"], skip_locked=True)
 
     summary = {
         "assessment_scope": (
@@ -609,18 +623,49 @@ def _sync_overlap_quality_flags(
     db: DatabaseManager,
     membership_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Replace the open overlap flags for ambiguous target-group matches."""
-    delete_sql = """
-        DELETE FROM silver.data_quality_flag
-        WHERE source_table = 'silver.vald_target_group_membership'
-          AND flag_type = 'duplicate_suspect'
-          AND resolution_status = 'open'
+    """Reconcile the open overlap flags for ambiguous target-group matches.
+
+    Phase 8.7.D (2026-05-09): the previous code DELETEd open flags and
+    re-asserted them, which destroyed the audit trail (flag_id reset on
+    every silver run, reviewer notes lost) and violated locked decision
+    #7 (no DELETE in ETL). The new pattern:
+
+      1. Mark every currently-``'open'`` ``'duplicate_suspect'`` flag
+         from this source as ``'superseded'``. Audit trail is preserved
+         (the row stays in the table) and the partial index
+         ``idx_quality_flag_status WHERE resolution_status='open'`` no
+         longer surfaces it as live.
+      2. Insert the freshly-derived flags. The ON CONFLICT clause
+         reactivates any (record, metric, flag_type) tuple that's still
+         ambiguous back to ``'open'`` with refreshed values. Manually
+         reviewed rows (``resolution_status NOT IN ('open','superseded')``)
+         are NOT touched — coaches' reviewer notes survive.
+
+    Net effect:
+      * still-ambiguous flags stay ``'open'`` (audit retained, ID
+        preserved across runs);
+      * no-longer-ambiguous flags stay ``'superseded'`` (visible for
+        audit, hidden from "open" readers);
+      * manually reviewed flags are preserved untouched.
+
+    Locked decision #7 satisfied: no DELETE on the live flag table.
+    """
+    # Step 1 — supersede currently-open flags from this source. This
+    # handles the "no longer ambiguous" case: any open flag whose tuple
+    # the new run does NOT re-assert keeps its ``'superseded'`` marker.
+    supersede_sql = """
+        UPDATE silver.data_quality_flag
+           SET resolution_status = 'superseded'
+         WHERE source_table = 'silver.vald_target_group_membership'
+           AND flag_type = 'duplicate_suspect'
+           AND resolution_status = 'open'
     """
     with db.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(delete_sql)
-            deleted = cur.rowcount
+            cur.execute(supersede_sql)
+            superseded = cur.rowcount
 
+    # Step 2 — collect the new ambiguous-membership flags to assert.
     memberships_by_profile: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in membership_rows:
         if row["is_ambiguous"]:
@@ -655,14 +700,87 @@ def _sync_overlap_quality_flags(
             )
         )
 
-    flags_written = QualityEngine(db).persist_flags(flags)
+    # Step 3 — UPSERT the new flags. The ON CONFLICT clause reactivates
+    # ``'superseded'`` rows back to ``'open'`` (so still-ambiguous flags
+    # keep their stable flag_id) but leaves manually reviewed rows alone
+    # (status NOT IN ('open','superseded')). This is the bespoke
+    # alternative to ``QualityEngine.persist_flags`` because that helper
+    # only reactivates ``'open'`` rows; here we explicitly want the
+    # "supersede + restore" semantic.
+    flags_written = _upsert_overlap_flags(db, flags)
+
     summary = {
-        "open_flags_deleted": deleted,
+        "open_flags_superseded": superseded,
         "flags_written": flags_written,
         "ambiguous_profiles": len(memberships_by_profile),
     }
     logger.info("VALD overlap quality summary: %s", summary)
     return summary
+
+
+def _upsert_overlap_flags(
+    db: DatabaseManager,
+    flags: list[QualityFlag],
+) -> int:
+    """Phase 8.7.D: UPSERT for the supersede-and-reactivate flow.
+
+    Reactivates ``'superseded'`` rows back to ``'open'`` so still-ambiguous
+    flags keep their stable ``flag_id`` across silver runs. Manually
+    reviewed rows (resolution_status NOT IN ('open','superseded')) are
+    left untouched.
+
+    This is intentionally separate from
+    ``ingestion.common.quality.QualityEngine.persist_flags`` (which only
+    updates ``'open'`` rows) so we don't change shared semantics.
+    """
+    if not flags:
+        return 0
+
+    import json
+
+    sql = """
+        INSERT INTO silver.data_quality_flag
+            (source_table, record_id, profile_id, tenant_id, test_date,
+             metric_name, metric_value, flag_type, severity, details, batch_id)
+        VALUES %s
+        ON CONFLICT (source_table, record_id, metric_name, flag_type)
+        DO UPDATE SET
+            metric_value      = EXCLUDED.metric_value,
+            severity          = EXCLUDED.severity,
+            details           = EXCLUDED.details,
+            batch_id          = EXCLUDED.batch_id,
+            profile_id        = EXCLUDED.profile_id,
+            tenant_id         = EXCLUDED.tenant_id,
+            test_date         = EXCLUDED.test_date,
+            resolution_status = 'open'
+        WHERE silver.data_quality_flag.resolution_status IN ('open', 'superseded')
+    """
+    template = (
+        "(%(source_table)s, %(record_id)s, %(profile_id)s, %(tenant_id)s,"
+        " %(test_date)s, %(metric_name)s, %(metric_value)s, %(flag_type)s,"
+        " %(severity)s, %(details)s, %(batch_id)s)"
+    )
+    records = [
+        {
+            "source_table": f.source_table,
+            "record_id": f.record_id,
+            "profile_id": f.profile_id,
+            "tenant_id": f.tenant_id,
+            "test_date": f.test_date,
+            "metric_name": f.metric_name,
+            "metric_value": f.metric_value,
+            "flag_type": f.flag_type,
+            "severity": f.severity,
+            "details": json.dumps(f.details),
+            "batch_id": f.batch_id,
+        }
+        for f in flags
+    ]
+    with db.connection() as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(cur, sql, records, template=template)
+    logger.info("Upserted %d overlap quality flags (supersede-reactivate)", len(records))
+    return len(records)
 
 
 def _select_primary_membership(
@@ -936,65 +1054,105 @@ def _load_assessment_metrics(
     dynamo_scope = None if not has_incremental_scope else scoped_test_ids_by_family.get("dynamo", [])
     forcedecks_scope = None if not has_incremental_scope else scoped_test_ids_by_family.get("forcedecks", [])
 
-    nordics = 0 if has_incremental_scope and not nordics_scope else _load_nordbord_metrics(
-        db,
-        profile_lookup,
-        profile_table=profile_table,
-        assessment_table=assessment_table,
-        day_start_utc=day_start_utc,
-        day_end_utc=day_end_utc,
-        scoped_test_ids=nordics_scope,
-    )
+    # Phase 8.8.A: each family is wrapped in track_stage so the
+    # bronze_to_silver flame graph attributes time to specific families.
+    # All 5 share the run_id set by the enclosing pipeline_run.
+    nordics = 0
+    if not (has_incremental_scope and not nordics_scope):
+        with track_stage(
+            "vald", "silver.assessment_metric", sub_stage="nordics", db=db,
+        ) as _m:
+            nordics = _load_nordbord_metrics(
+                db,
+                profile_lookup,
+                profile_table=profile_table,
+                assessment_table=assessment_table,
+                day_start_utc=day_start_utc,
+                day_end_utc=day_end_utc,
+                scoped_test_ids=nordics_scope,
+            )
+            _m["rows_written"] = nordics
     by_family["nordics"] += nordics
 
-    forceframe = 0 if has_incremental_scope and not forceframe_scope else _load_forceframe_metrics(
-        db,
-        profile_lookup,
-        profile_table=profile_table,
-        assessment_table=assessment_table,
-        day_start_utc=day_start_utc,
-        day_end_utc=day_end_utc,
-        scoped_test_ids=forceframe_scope,
-    )
+    forceframe = 0
+    if not (has_incremental_scope and not forceframe_scope):
+        with track_stage(
+            "vald", "silver.assessment_metric", sub_stage="forceframe", db=db,
+        ) as _m:
+            forceframe = _load_forceframe_metrics(
+                db,
+                profile_lookup,
+                profile_table=profile_table,
+                assessment_table=assessment_table,
+                day_start_utc=day_start_utc,
+                day_end_utc=day_end_utc,
+                scoped_test_ids=forceframe_scope,
+            )
+            _m["rows_written"] = forceframe
     by_family["forceframe"] += forceframe
 
-    smartspeed_counts = {} if has_incremental_scope and not speed_scope else _load_smartspeed_metrics(
-        db,
-        profile_lookup,
-        profile_table=profile_table,
-        assessment_table=assessment_table,
-        day_start_utc=day_start_utc,
-        day_end_utc=day_end_utc,
-        scoped_test_ids=speed_scope,
-    )
+    smartspeed_counts: dict[str, int] = {}
+    if not (has_incremental_scope and not speed_scope):
+        with track_stage(
+            "vald", "silver.assessment_metric", sub_stage="smartspeed", db=db,
+        ) as _m:
+            smartspeed_counts = _load_smartspeed_metrics(
+                db,
+                profile_lookup,
+                profile_table=profile_table,
+                assessment_table=assessment_table,
+                day_start_utc=day_start_utc,
+                day_end_utc=day_end_utc,
+                scoped_test_ids=speed_scope,
+            )
+            _m["rows_written"] = sum(smartspeed_counts.values())
     for family, count in smartspeed_counts.items():
         by_family[family] += count
 
-    dynamo = 0 if has_incremental_scope and not dynamo_scope else _load_dynamo_metrics(
-        db,
-        profile_lookup,
-        profile_table=profile_table,
-        assessment_table=assessment_table,
-        day_start_utc=day_start_utc,
-        day_end_utc=day_end_utc,
-        scoped_test_ids=dynamo_scope,
-    )
+    dynamo = 0
+    if not (has_incremental_scope and not dynamo_scope):
+        with track_stage(
+            "vald", "silver.assessment_metric", sub_stage="dynamo", db=db,
+        ) as _m:
+            dynamo = _load_dynamo_metrics(
+                db,
+                profile_lookup,
+                profile_table=profile_table,
+                assessment_table=assessment_table,
+                day_start_utc=day_start_utc,
+                day_end_utc=day_end_utc,
+                scoped_test_ids=dynamo_scope,
+            )
+            _m["rows_written"] = dynamo
     by_family["dynamo"] += dynamo
 
-    forcedecks = 0 if has_incremental_scope and not forcedecks_scope else _insert_forcedecks_family(
-        db,
-        family="forcedecks",
-        profile_table=profile_table,
-        assessment_table=assessment_table,
-        day_start_utc=day_start_utc,
-        day_end_utc=day_end_utc,
-        scoped_test_ids=forcedecks_scope,
-        enable_full_refresh_sharding=(
-            not has_incremental_scope
-            and day_start_utc is None
-            and day_end_utc is None
-        ),
-    )
+    forcedecks = 0
+    if not (has_incremental_scope and not forcedecks_scope):
+        with track_stage(
+            "vald", "silver.assessment_metric", sub_stage="forcedecks", db=db,
+            extra={
+                "sharded": (
+                    not has_incremental_scope
+                    and day_start_utc is None
+                    and day_end_utc is None
+                ),
+            },
+        ) as _m:
+            forcedecks = _insert_forcedecks_family(
+                db,
+                family="forcedecks",
+                profile_table=profile_table,
+                assessment_table=assessment_table,
+                day_start_utc=day_start_utc,
+                day_end_utc=day_end_utc,
+                scoped_test_ids=forcedecks_scope,
+                enable_full_refresh_sharding=(
+                    not has_incremental_scope
+                    and day_start_utc is None
+                    and day_end_utc is None
+                ),
+            )
+            _m["rows_written"] = forcedecks
     by_family["forcedecks"] += forcedecks
 
     summary = {
