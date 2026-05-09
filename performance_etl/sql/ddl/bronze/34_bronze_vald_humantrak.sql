@@ -1,0 +1,9 @@
+-- =============================================================================
+-- File: 34_bronze_vald_humantrak.sql
+-- Description: HumanTrak bronze tables are retired from the active VALD
+--              ingestion scope.
+--
+-- This file is intentionally left without CREATE TABLE statements so new
+-- environments do not recreate the retired HumanTrak landing tables.
+-- Existing databases are cleaned by 38_bronze_vald_prune_unused.sql.
+-- =============================================================================

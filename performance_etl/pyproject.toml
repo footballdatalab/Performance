@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "performance-hub"
+version = "0.1.0"
+description = "VALD performance data pipeline"
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+    # Core
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0",
+    # Database
+    "psycopg2-binary>=2.9.9",
+    # HTTP / API clients
+    "requests>=2.31.0",
+    "urllib3>=2.0.0",
+    # Data validation
+    "pydantic>=2.5.0",
+    # Ingestion utilities
+    "tenacity>=8.2.0",
+    # Fuzzy matching
+    "thefuzz>=0.22.0",
+    "python-Levenshtein>=0.25.0",
+    "pandas>=3.0.2",
+    "beautifulsoup4>=4.14.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "responses>=0.25.0",
+    "ruff>=0.4.0",
+]
+dbt = [
+    "dbt-postgres>=1.7.0",
+]
+
+[project.scripts]
+start_airflow_stack = "script.start_airflow_stack:main"
+bootstrap_database = "ingestion.bootstrap:main_bootstrap_database"
+run_catapult_ingestion = "ingestion.catapult.pipeline:main_run_ingestion"
+run_catapult_extract_raw = "ingestion.catapult.pipeline:main_run_extract_raw"
+run_catapult_review = "ingestion.catapult.review:main_run_review"
+run_catapult_raw_to_bronze = "ingestion.catapult.pipeline:main_run_raw_to_bronze"
+run_catapult_position_sync = "ingestion.catapult.position_sync:main_run_position_sync"
+run_vald_ingestion = "ingestion.vald.pipeline:main_run_ingestion"
+run_vald_reset_rebuild = "ingestion.vald.pipeline:main_run_reset_rebuild"
+run_vald_extract_raw = "ingestion.vald.pipeline:main_run_extract_raw"
+run_vald_raw_to_bronze = "ingestion.vald.pipeline:main_run_raw_to_bronze"
+run_vald_bronze_to_silver = "ingestion.vald.pipeline:main_run_bronze_to_silver"
+run_vald_silver_to_gold = "ingestion.vald.pipeline:main_run_silver_to_gold"
+run_vald_resume_pipeline = "ingestion.vald.pipeline:main_run_resume_pipeline"
+validate_vald_pipeline = "ingestion.vald.pipeline:main_validate_pipeline"
+
+[tool.setuptools.packages.find]
+include = ["ingestion*", "script*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]

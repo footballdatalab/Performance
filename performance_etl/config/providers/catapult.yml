@@ -1,0 +1,73 @@
+provider: catapult
+api_version: v6
+base_url_env: CATAPULT_BASE_URL
+region: eu
+
+accounts:
+  - name: CATAPULT_A
+    api_key_env: CATAPULT_A_API_KEY
+    team_code: A
+    team_level: senior
+
+  - name: CATAPULT_B
+    api_key_env: CATAPULT_B_API_KEY
+    team_code: B
+    team_level: senior
+
+  - name: CATAPULT_U15
+    api_key_env: CATAPULT_U15_API_KEY
+    team_code: U15
+    team_level: academy
+
+  - name: CATAPULT_U16
+    api_key_env: CATAPULT_U16_API_KEY
+    team_code: U16
+    team_level: academy
+
+  - name: CATAPULT_SUB17
+    api_key_env: CATAPULT_U17_API_KEY
+    team_code: SUB17
+    team_level: academy
+
+  - name: CATAPULT_U19
+    api_key_env: CATAPULT_U19_API_KEY
+    team_code: U19
+    team_level: academy
+
+  - name: CATAPULT_FEMININO
+    api_key_env: CATAPULT_FEMININO_API_KEY
+    team_code: FEMININO
+    team_level: senior
+
+endpoints:
+  reference:
+    - teams
+    - athletes
+    - positions
+    - parameters
+    - tags
+    - tag_types
+    - entity_tags
+    - venues
+  session:
+    - activities
+    - periods
+    - annotations
+  performance:
+    - stats
+    - efforts
+    - events
+    - sensor_data
+
+pagination:
+  default_page_size: 100
+  strategy: page_number
+
+rate_limiting:
+  delay_between_requests_ms: 200
+  max_retries: 3
+  backoff_factor: 2
+
+replay:
+  replay_chunk_size: 1000  # CATAPULT_REPLAY_CHUNK_SIZE - keyset replay chunk
+  sensor_data_replay_chunk_size: 100  # CATAPULT_SENSOR_DATA_REPLAY_CHUNK_SIZE - sensor-data keyset chunk

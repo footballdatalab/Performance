@@ -1,0 +1,31 @@
+# Core
+python-dotenv>=1.0.0
+pyyaml>=6.0
+
+# Database
+psycopg2-binary>=2.9.9
+
+# HTTP / API clients
+requests>=2.31.0
+urllib3>=2.0.0
+
+# Data validation
+pydantic>=2.5.0
+
+# Ingestion utilities
+tenacity>=8.2.0
+
+# dbt
+dbt-postgres>=1.7.0
+
+# Airflow (install separately in Airflow environment)
+# apache-airflow>=2.8.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+responses>=0.25.0
+
+# Fuzzy matching
+thefuzz>=0.22.0
+python-Levenshtein>=0.25.0

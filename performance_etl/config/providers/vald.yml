@@ -1,0 +1,154 @@
+provider: vald
+auth:
+  token_url_env: VALD_TOKEN_URL
+  client_id_env: VALD_CLIENT_ID
+  client_secret_env: VALD_CLIENT_SECRET
+  audience: vald-api-external
+  token_buffer_seconds: 60
+
+region_env: VALD_REGION
+
+regional_hosts:
+  au:
+    tenants: prd-aue-api-externaltenants.valdperformance.com
+    profiles: prd-aue-api-externalprofile.valdperformance.com
+    forcedecks: prd-aue-api-extforcedecks.valdperformance.com
+    forceframe: prd-aue-api-externalforceframe.valdperformance.com
+    nordbord: prd-aue-api-externalnordbord.valdperformance.com
+    humantrak: prd-aue-api-externalhumantrakv2.valdperformance.com
+    smartspeed: prd-aue-api-extsmartspeed.valdperformance.com
+    dynamo: prd-aue-api-extdynamo.valdperformance.com
+  us:
+    tenants: prd-use-api-externaltenants.valdperformance.com
+    profiles: prd-use-api-externalprofile.valdperformance.com
+    forcedecks: prd-use-api-extforcedecks.valdperformance.com
+    forceframe: prd-use-api-externalforceframe.valdperformance.com
+    nordbord: prd-use-api-externalnordbord.valdperformance.com
+    humantrak: prd-use-api-externalhumantrakv2.valdperformance.com
+    smartspeed: prd-use-api-extsmartspeed.valdperformance.com
+    dynamo: prd-use-api-extdynamo.valdperformance.com
+  eu:
+    tenants: prd-euw-api-externaltenants.valdperformance.com
+    profiles: prd-euw-api-externalprofile.valdperformance.com
+    forcedecks: prd-euw-api-extforcedecks.valdperformance.com
+    forceframe: prd-euw-api-externalforceframe.valdperformance.com
+    nordbord: prd-euw-api-externalnordbord.valdperformance.com
+    humantrak: prd-euw-api-externalhumantrakv2.valdperformance.com
+    smartspeed: prd-euw-api-extsmartspeed.valdperformance.com
+    dynamo: prd-euw-api-extdynamo.valdperformance.com
+
+modules:
+  - name: forcedecks
+    enabled: true
+    sync_strategy: watermark
+    watermark_param: modifiedFromUtc
+    watermark_response_field: modifiedDateUtc
+    termination_signal: status_204
+
+  - name: forceframe
+    enabled: true
+    sync_strategy: watermark
+    watermark_param: modifiedFromUtc
+    watermark_response_field: modifiedDateUtc
+    termination_signal: status_204
+
+  - name: nordbord
+    enabled: true
+    sync_strategy: watermark
+    watermark_param: modifiedFromUtc
+    watermark_response_field: modifiedDateUtc
+    termination_signal: status_204
+
+  - name: smartspeed
+    enabled: true
+    sync_strategy: page_watermark
+    watermark_param: modifiedFromUtc
+    watermark_source: request_timestamp
+    termination_signal: empty_array
+    page_param: page
+
+  - name: dynamo
+    enabled: true
+    sync_strategy: page_watermark
+    watermark_param: modifiedFromUtc
+    watermark_source: request_timestamp
+    termination_signal: page_exhausted
+    page_param: page
+
+# Target groups to include in silver/gold layers.
+# Raw + bronze remain the full VALD landing area; downstream layers only
+# include athletes assigned to exactly one of these Active groups.
+target_groups:
+  - group_id: "52212470-1cc3-4def-a23d-4fe4d478f2e8"
+    group_name: "Equipa A Active"
+    category_id: "da0f2b5b-bb60-4d92-bf0f-7dd65725444f"
+  - group_id: "308c1b82-1fda-452d-8ad5-dc160cfa62d7"
+    group_name: "Equipa A Feminino Active"
+    category_id: "9ac773a7-a3dd-4f82-8f70-6207cd4efe34"
+  - group_id: "1a1cf03f-a7ee-4379-8e96-7eceb9709f8b"
+    group_name: "Equipa B Active"
+    category_id: "38f2f7ef-e5cc-4969-873a-cde59c12724e"
+  - group_id: "ad5752f8-4bbe-4083-8535-95771d20a5aa"
+    group_name: "Equipa Feminina U11-U9 Active"
+    category_id: "9c61af6f-bdd0-448c-b03e-f4c94dfa485d"
+  - group_id: "0daa620e-59bb-42cd-bab0-ace70f74cd70"
+    group_name: "Equipa Feminina U15-U13 Active"
+    category_id: "f9c3188f-010f-42de-8398-0175d9974107"
+  - group_id: "b48cef0a-22fe-48aa-870d-bdccd17b2a1d"
+    group_name: "Equipa Feminina U17 Active"
+    category_id: "41b097cd-b8c1-44f8-8c35-5addbc297119"
+  - group_id: "2c8db01c-f345-4ed8-aed0-3fd95124acb3"
+    group_name: "Equipa Feminina U19-B Active"
+    category_id: "f54a4fc1-8396-4e3b-9855-e16d7c739a2b"
+  - group_id: "cc392654-ae05-4eeb-9d81-4d2c4ae52074"
+    group_name: "Equipa U14 Active"
+    category_id: "248c6998-6ca4-48b5-a0d5-a0e66594c53c"
+  - group_id: "f86825d2-2ded-4d3f-81f6-3139428a5a61"
+    group_name: "Equipa U15 Active"
+    category_id: "acb86c67-a85d-46b1-b452-490785fe1bc8"
+  - group_id: "95e7cc5e-6670-4a97-9a6b-051f1e98d212"
+    group_name: "Equipa U16 Active"
+    category_id: "ef585ff1-63b9-42ad-a159-69e22d354282"
+  - group_id: "58563852-d28b-4194-8218-4a19b60c7653"
+    group_name: "Equipa U17 Active"
+    category_id: "60df2480-02ba-417f-a99c-bc29028c6e3b"
+  - group_id: "a0ed4b1d-c8c2-4eba-9d30-af9f004fc424"
+    group_name: "Equipa U19 Active"
+    category_id: "b924cd42-cf86-4a38-8b34-05c59e38211a"
+
+# Downstream exclusion is implicit: Others, Modalidades, Futsal,
+# Desporto Adaptado, and Staff stay in raw/bronze only.
+
+rate_limiting:
+  max_retries: 3
+  backoff_base_seconds: 1
+  backoff_max_seconds: 60
+  jitter: true
+
+# -----------------------------------------------------------------------------
+# Performance tunables for vald_midnight_full_refresh.
+# Each value can be overridden by the corresponding environment variable.
+# Defaults are tuned for the current ~5 tenant / ~12 target-group footprint.
+# -----------------------------------------------------------------------------
+performance:
+  # Bronze extraction
+  fd_trials_workers: 16        # VALD_FD_TRIALS_WORKERS — concurrent get_trials calls per tenant
+  tenant_workers: 4            # VALD_TENANT_WORKERS    — concurrent tenants per module
+
+  # Bronze raw->bronze replay
+  replay_chunk_size: 5000      # VALD_REPLAY_CHUNK_SIZE        — keyset chunk
+  replay_commit_batch_size: 5000  # VALD_REPLAY_COMMIT_BATCH_SIZE — rows per commit
+  forceframe_trace_replay_chunk_size: 100  # VALD_FORCEFRAME_TRACE_REPLAY_CHUNK_SIZE - ForceFrame trace keyset chunk
+  forceframe_trace_replay_commit_batch_size: 25  # VALD_FORCEFRAME_TRACE_REPLAY_COMMIT_BATCH_SIZE - ForceFrame trace rows per commit
+  dynamo_trace_replay_chunk_size: 50  # VALD_DYNAMO_TRACE_REPLAY_CHUNK_SIZE - DynaMo trace keyset chunk
+  dynamo_trace_replay_commit_batch_size: 25  # VALD_DYNAMO_TRACE_REPLAY_COMMIT_BATCH_SIZE - DynaMo trace rows per commit
+
+  # Silver
+  silver_fd_buckets: 8         # VALD_SILVER_FD_BUCKETS        — parallel hash shards for trial_results backfill
+  silver_fd_group_workers: 4   # VALD_SILVER_FD_GROUP_WORKERS  — parallel target_group inserts
+
+  # Gold
+  gold_family_workers: 5       # VALD_GOLD_FAMILY_WORKERS      — parallel family publishers
+
+  # PostgreSQL pool — bump to fit the new in-task fan-out.
+  postgres_pool_max_connections: 32   # POSTGRES_POOL_MAX_CONNECTIONS
